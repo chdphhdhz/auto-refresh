@@ -1,68 +1,220 @@
-let isRunning = false;
+const REFRESH_ALARM = "auto-refresh-next-round";
+const BADGE_COLOR = "#b8a2e8";
+const DEFAULT_STATE = {
+  isRunning: false,
+  minSec: 8,
+  maxSec: 10,
+  targetTabId: null,
+  targetWindowId: null,
+  nextRefreshAt: null
+};
+
 let countDownTimer = null;
-let currentLeft = 0;
-let minSec = 10;
-let maxSec = 30;
+let refreshTimer = null;
+let refreshInProgress = false;
 
-// 取随机数 包含 min ~ max
-function getRandom() {
-    return Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
+function getRandom(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// 清空所有 + 清除角标
-function fullStop() {
-    isRunning = false;
-    if (countDownTimer) {
-        clearInterval(countDownTimer);
-        countDownTimer = null;
+async function getState() {
+  const state = await chrome.storage.local.get(DEFAULT_STATE);
+  return { ...DEFAULT_STATE, ...state };
+}
+
+async function saveState(patch) {
+  await chrome.storage.local.set(patch);
+}
+
+function clearLocalTimers() {
+  if (countDownTimer) {
+    clearInterval(countDownTimer);
+    countDownTimer = null;
+  }
+
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+async function clearBadge() {
+  await chrome.action.setBadgeText({ text: "" });
+}
+
+async function setBadgeSeconds(seconds) {
+  await chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
+  await chrome.action.setBadgeText({ text: String(Math.max(0, seconds)) });
+}
+
+function getSecondsLeft(nextRefreshAt) {
+  return Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
+}
+
+function startBadgeCountdown(nextRefreshAt) {
+  if (countDownTimer) {
+    clearInterval(countDownTimer);
+  }
+
+  setBadgeSeconds(getSecondsLeft(nextRefreshAt));
+
+  countDownTimer = setInterval(async () => {
+    const state = await getState();
+    if (!state.isRunning || !state.nextRefreshAt) {
+      clearLocalTimers();
+      await clearBadge();
+      return;
     }
-    chrome.action.setBadgeText({ text: "" });
+
+    await setBadgeSeconds(getSecondsLeft(state.nextRefreshAt));
+  }, 1000);
 }
 
-// 执行刷新
-async function reloadTab() {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) chrome.tabs.reload(tab.id);
+function armExactRefresh(nextRefreshAt) {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+  }
+
+  const delayMs = Math.max(0, nextRefreshAt - Date.now());
+  refreshTimer = setTimeout(() => {
+    handleRefreshDue();
+  }, delayMs);
 }
 
-// 开启新一轮
-function nextRound() {
-    if (!isRunning) return;
+async function reloadTargetTab(state) {
+  if (state.targetTabId) {
+    try {
+      await chrome.tabs.reload(state.targetTabId);
+      return;
+    } catch (error) {
+      await saveState({ targetTabId: null, targetWindowId: null });
+    }
+  }
 
-    currentLeft = getRandom();
-
-    countDownTimer = setInterval(() => {
-        if (!isRunning) {
-            fullStop();
-            return;
-        }
-
-        currentLeft--;
-        chrome.action.setBadgeText({ text: currentLeft + "" });
-        chrome.action.setBadgeBackgroundColor({ color: "#b8a2e8" });
-
-        if (currentLeft <= 0) {
-            clearInterval(countDownTimer);
-            reloadTab();
-            setTimeout(nextRound, 100);
-        }
-    }, 1000);
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (tab?.id) {
+    await chrome.tabs.reload(tab.id);
+    await saveState({ targetTabId: tab.id, targetWindowId: tab.windowId });
+  }
 }
 
-// 监听指令
-chrome.runtime.onMessage.addListener(msg => {
+async function scheduleNextRound() {
+  const state = await getState();
+  if (!state.isRunning) {
+    clearLocalTimers();
+    await chrome.alarms.clear(REFRESH_ALARM);
+    await clearBadge();
+    return;
+  }
+
+  const nextRefreshAt = Date.now() + getRandom(state.minSec, state.maxSec) * 1000;
+  await saveState({ nextRefreshAt });
+  await chrome.alarms.clear(REFRESH_ALARM);
+  await chrome.alarms.create(REFRESH_ALARM, { when: nextRefreshAt });
+  armExactRefresh(nextRefreshAt);
+  startBadgeCountdown(nextRefreshAt);
+}
+
+async function handleRefreshDue() {
+  if (refreshInProgress) return;
+
+  refreshInProgress = true;
+  try {
+    const state = await getState();
+    if (!state.isRunning || !state.nextRefreshAt) {
+      clearLocalTimers();
+      await clearBadge();
+      return;
+    }
+
+    if (Date.now() + 500 < state.nextRefreshAt) {
+      armExactRefresh(state.nextRefreshAt);
+      startBadgeCountdown(state.nextRefreshAt);
+      return;
+    }
+
+    await setBadgeSeconds(0);
+    await reloadTargetTab(state);
+    await scheduleNextRound();
+  } finally {
+    refreshInProgress = false;
+  }
+}
+
+async function startAutoRefresh(minSec, maxSec) {
+  clearLocalTimers();
+  await chrome.alarms.clear(REFRESH_ALARM);
+
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  await saveState({
+    isRunning: true,
+    minSec,
+    maxSec,
+    targetTabId: tab?.id ?? null,
+    targetWindowId: tab?.windowId ?? null,
+    nextRefreshAt: null
+  });
+
+  await scheduleNextRound();
+  return getState();
+}
+
+async function stopAutoRefresh() {
+  clearLocalTimers();
+  await chrome.alarms.clear(REFRESH_ALARM);
+  await saveState({ isRunning: false, nextRefreshAt: null });
+  await clearBadge();
+  return getState();
+}
+
+async function restoreAutoRefresh() {
+  const state = await getState();
+  if (!state.isRunning || !state.nextRefreshAt) {
+    await clearBadge();
+    return;
+  }
+
+  await chrome.alarms.create(REFRESH_ALARM, { when: state.nextRefreshAt });
+  if (Date.now() >= state.nextRefreshAt) {
+    await handleRefreshDue();
+    return;
+  }
+
+  armExactRefresh(state.nextRefreshAt);
+  startBadgeCountdown(state.nextRefreshAt);
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  (async () => {
     if (msg.type === "start") {
-        fullStop();
-        minSec = msg.min;
-        maxSec = msg.max;
-        isRunning = true;
-        nextRound();
+      const state = await startAutoRefresh(msg.min, msg.max);
+      sendResponse({ ok: true, state });
+      return;
     }
 
     if (msg.type === "stop") {
-        fullStop();
+      const state = await stopAutoRefresh();
+      sendResponse({ ok: true, state });
+      return;
     }
+
+    if (msg.type === "getState") {
+      sendResponse({ ok: true, state: await getState() });
+      return;
+    }
+
+    sendResponse({ ok: false, error: "Unknown message type" });
+  })().catch(error => {
+    sendResponse({ ok: false, error: error.message });
+  });
+
+  return true;
 });
 
-// 浏览器卸载
-chrome.runtime.onSuspend.addListener(fullStop);
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === REFRESH_ALARM) {
+    handleRefreshDue();
+  }
+});
+
+restoreAutoRefresh();
